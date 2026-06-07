@@ -54,9 +54,9 @@
 void setup() {
     Serial.begin(115200);
 
-    // Initialize display, touch, and LVGL.  Pass 0/1/2/3 to rotate (see header):
-    //   0, 2 = portrait (240x320)   1, 3 = landscape (320x240)
-    lv_setup.begin(0);
+    // Initialize display, touch, and LVGL.  Defaults to portrait; pass a
+    // rotation to change it (0/2 = portrait, 1/3 = landscape; see header).
+    lv_setup.begin();
     Serial.printf("LVGL initialized with %dx%d touchscreen\n",
                   display.width(), display.height());
 
