@@ -27,34 +27,43 @@
 #define ILI9341_MADCTL_MX  0x40
 #define ILI9341_MADCTL_MV  0x20
 
-// SPI DMA transfers are capped well under the ESP-IDF limit per chunk.
-static const size_t CYD_SPI_MAX_CHUNK = 32768;
+// Largest single SPI transfer we size DMA descriptors for: a full screen, so
+// any partial flush region fits in one queued transaction.
+static const size_t CYD_MAX_TRANSFER =
+    (size_t)CYD_TFT_NATIVE_WIDTH * CYD_TFT_NATIVE_HEIGHT * 2;
+
+// CS is driven by the SPI peripheral (hardware CS), but DC is a plain GPIO.
+// The driver calls this just before each transaction goes on the bus — for
+// queued transactions that's in ISR context — and we set DC from the
+// transaction's `user` field: 0 = command, 1 = data.
+static void _cyd_spi_pre_cb(spi_transaction_t *t) {
+    gpio_set_level((gpio_num_t)CYD_TFT_DC, (int)(intptr_t)t->user);
+}
 
 chipguy_cyd2432S028_display::chipguy_cyd2432S028_display() {}
 
 // ── Low-level SPI helpers ──────────────────────────────────────────────────
+// DC and CS are handled by the pre-callback and hardware CS respectively, so
+// these just submit the bytes.  All command/parameter traffic is synchronous
+// (polling); only the pixel blit is queued asynchronously (see flushRegion).
 
 void chipguy_cyd2432S028_display::_cmd(uint8_t cmd) {
     if (!_spi) return;
-    gpio_set_level((gpio_num_t)CYD_TFT_DC, 0);   // command
-    gpio_set_level((gpio_num_t)CYD_TFT_CS, 0);
     spi_transaction_t t = {};
     t.length = 8;
     t.tx_data[0] = cmd;
     t.flags = SPI_TRANS_USE_TXDATA;
+    t.user = (void *)0;          // DC = command
     spi_device_polling_transmit(_spi, &t);
-    gpio_set_level((gpio_num_t)CYD_TFT_CS, 1);
 }
 
 void chipguy_cyd2432S028_display::_data(const uint8_t *data, size_t len) {
     if (!_spi || len == 0) return;
-    gpio_set_level((gpio_num_t)CYD_TFT_DC, 1);   // data
-    gpio_set_level((gpio_num_t)CYD_TFT_CS, 0);
     spi_transaction_t t = {};
     t.length = len * 8;
     t.tx_buffer = data;
+    t.user = (void *)1;          // DC = data
     spi_device_polling_transmit(_spi, &t);
-    gpio_set_level((gpio_num_t)CYD_TFT_CS, 1);
 }
 
 void chipguy_cyd2432S028_display::_data8(uint8_t val) {
@@ -111,31 +120,33 @@ void chipguy_cyd2432S028_display::_setAddrWindow(int x0, int y0, int x1, int y1)
     _cmd(0x2C);              // RAMWR — Memory Write
 }
 
+// Synchronous (blocking) pixel push, used by fillScreen().  The interactive
+// path uses the queued/async flushRegion() instead.
 void chipguy_cyd2432S028_display::_pushPixels(const uint8_t *data, size_t bytes) {
     if (!_spi || bytes == 0) return;
-    gpio_set_level((gpio_num_t)CYD_TFT_DC, 1);
-    gpio_set_level((gpio_num_t)CYD_TFT_CS, 0);
+    spi_transaction_t t = {};
+    t.length = bytes * 8;
+    t.tx_buffer = data;
+    t.user = (void *)1;          // DC = data
+    spi_device_polling_transmit(_spi, &t);
+}
 
-    while (bytes > 0) {
-        size_t chunk = (bytes > CYD_SPI_MAX_CHUNK) ? CYD_SPI_MAX_CHUNK : bytes;
-        spi_transaction_t t = {};
-        t.length = chunk * 8;
-        t.tx_buffer = data;
-        spi_device_polling_transmit(_spi, &t);
-        data  += chunk;
-        bytes -= chunk;
+// Block until the in-flight async pixel DMA (if any) has completed, so the bus
+// is idle before we touch it directly.
+void chipguy_cyd2432S028_display::_waitPixelDone() {
+    if (_pixelBusy) {
+        spi_transaction_t *result = nullptr;
+        spi_device_get_trans_result(_spi, &result, portMAX_DELAY);
+        _pixelBusy = false;
     }
-
-    gpio_set_level((gpio_num_t)CYD_TFT_CS, 1);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
 bool chipguy_cyd2432S028_display::begin(uint16_t rotation) {
-    // DC and CS are GPIO-driven (we manage them around each transaction).
+    // DC is driven by the pre-transaction callback; configure it as output.
+    // CS is owned by the SPI peripheral (hardware CS), so we don't touch it.
     gpio_set_direction((gpio_num_t)CYD_TFT_DC, GPIO_MODE_OUTPUT);
-    gpio_set_direction((gpio_num_t)CYD_TFT_CS, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)CYD_TFT_CS, 1);   // deselect
 
     // Hardware reset pulse.
     gpio_set_direction((gpio_num_t)CYD_TFT_RST, GPIO_MODE_OUTPUT);
@@ -153,7 +164,7 @@ bool chipguy_cyd2432S028_display::begin(uint16_t rotation) {
     buscfg.sclk_io_num = CYD_TFT_SCLK;
     buscfg.quadwp_io_num = -1;
     buscfg.quadhd_io_num = -1;
-    buscfg.max_transfer_sz = CYD_SPI_MAX_CHUNK;
+    buscfg.max_transfer_sz = CYD_MAX_TRANSFER;
 
     esp_err_t err = spi_bus_initialize(CYD_TFT_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -164,8 +175,9 @@ bool chipguy_cyd2432S028_display::begin(uint16_t rotation) {
     spi_device_interface_config_t devcfg = {};
     devcfg.clock_speed_hz = CYD_TFT_SPI_HZ;
     devcfg.mode = 0;
-    devcfg.spics_io_num = -1;           // manual CS
-    devcfg.queue_size = 1;
+    devcfg.spics_io_num = CYD_TFT_CS;   // hardware-managed CS
+    devcfg.queue_size = 1;              // one async pixel transfer in flight
+    devcfg.pre_cb = _cyd_spi_pre_cb;    // sets DC from each transaction's user flag
     devcfg.flags = SPI_DEVICE_NO_DUMMY;
 
     err = spi_bus_add_device(CYD_TFT_SPI_HOST, &devcfg, &_spi);
@@ -185,6 +197,7 @@ bool chipguy_cyd2432S028_display::begin(uint16_t rotation) {
 }
 
 void chipguy_cyd2432S028_display::setRotation(uint16_t rotation) {
+    _waitPixelDone();           // bus must be idle before we send a command
     _rotation = cyd_normalize_rotation(rotation);
     uint8_t madctl = CYD_MADCTL_BGR;
 
@@ -222,6 +235,10 @@ void chipguy_cyd2432S028_display::setBacklight(int percentage) {
     analogWrite(CYD_TFT_BL, percentage * 255 / 100);
 }
 
+// Asynchronous flush.  Returns once this region's pixel DMA has been *queued*,
+// not when it finishes — the caller (LVGL via lv_setup) is then free to render
+// the next region into the other buffer while this one transmits.  The bus is
+// serialized by blocking on the *previous* flush's DMA at the top of this one.
 void chipguy_cyd2432S028_display::flushRegion(int x1, int y1, int x2, int y2,
                                               uint16_t *pixels) {
     if (!_spi) return;
@@ -230,18 +247,44 @@ void chipguy_cyd2432S028_display::flushRegion(int x1, int y1, int x2, int y2,
     int h = y2 - y1 + 1;
     size_t count = (size_t)w * h;
 
+    // The swap below mutates THIS region's buffer.  With double buffering LVGL
+    // hands us a different buffer than the one the previous flush is still
+    // DMA'ing, so the swap safely overlaps that transfer.  Guard the (not
+    // expected) case where we're handed the in-flight buffer: wait first.
+    if (_pixelBusy && (const void *)pixels == _pixelTrans.tx_buffer) {
+        _waitPixelDone();
+    }
+
     // LVGL renders RGB565 little-endian (native ESP32); the ILI9341 expects
-    // big-endian (MSB first).  Swap in place before transmitting.
+    // big-endian (MSB first).  Swap in place — overlaps the previous region's
+    // in-flight DMA (different buffer) for free.
     for (size_t i = 0; i < count; i++) {
         pixels[i] = __builtin_bswap16(pixels[i]);
     }
 
+    // Now wait for the previous flush's DMA to finish, so the SPI bus is free
+    // for this region's address window and pixel transfer.
+    _waitPixelDone();
+
+    // Address window (synchronous commands), then queue the pixel blit.
     _setAddrWindow(x1, y1, x2, y2);
-    _pushPixels((const uint8_t *)pixels, count * 2);
+
+    _pixelTrans = {};
+    _pixelTrans.length = count * 16;        // bits (2 bytes per pixel)
+    _pixelTrans.tx_buffer = pixels;
+    _pixelTrans.user = (void *)1;           // DC = data
+    if (spi_device_queue_trans(_spi, &_pixelTrans, portMAX_DELAY) == ESP_OK) {
+        _pixelBusy = true;
+    }
+}
+
+void chipguy_cyd2432S028_display::waitFlush() {
+    _waitPixelDone();
 }
 
 void chipguy_cyd2432S028_display::fillScreen(uint16_t color) {
     if (!_spi) return;
+    _waitPixelDone();           // drain any queued async flush first
     uint16_t be = __builtin_bswap16(color);
 
     // One-row buffer pushed for every row.  Must be DMA-capable: the ESP-IDF
