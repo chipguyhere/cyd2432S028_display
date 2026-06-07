@@ -64,7 +64,17 @@ public:
     // are inclusive.  `pixels` is in LVGL's native little-endian byte order;
     // this call byte-swaps it in place to the big-endian order the ILI9341
     // expects, so the buffer is modified.
+    //
+    // Asynchronous: it byte-swaps, waits for the PREVIOUS flush's DMA to finish,
+    // sends the address window, then QUEUES this region's pixel DMA and returns
+    // before it completes.  With double buffering, the caller can render the
+    // next region into the other buffer while this one transmits.  `pixels`
+    // must stay valid and untouched until the next flushRegion()/waitFlush().
     void flushRegion(int x1, int y1, int x2, int y2, uint16_t *pixels);
+
+    // Block until the most recently queued flush has finished transmitting.
+    // Call before tearing down or doing direct drawing after a flush.
+    void waitFlush();
 
     // Fill the whole screen with one RGB565 color (handy for bring-up tests).
     void fillScreen(uint16_t color);
@@ -75,10 +85,14 @@ private:
     int16_t _h = CYD_TFT_NATIVE_HEIGHT;
     uint8_t _rotation = 0;
 
+    spi_transaction_t _pixelTrans = {};   // persistent: queued DMA reads it async
+    bool _pixelBusy = false;              // true while a queued flush is in flight
+
     void _cmd(uint8_t cmd);
     void _data(const uint8_t *data, size_t len);
     void _data8(uint8_t val);
     void _initPanel();
     void _setAddrWindow(int x0, int y0, int x1, int y1);
     void _pushPixels(const uint8_t *data, size_t bytes);
+    void _waitPixelDone();
 };
