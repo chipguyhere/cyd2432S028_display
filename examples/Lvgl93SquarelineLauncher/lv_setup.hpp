@@ -43,14 +43,17 @@ public:
         // independent of how LVGL's own lv_conf.h color depth resolved.
         lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
 
-        // One DMA-capable partial-render buffer (RGB565 = 2 bytes/pixel).
+        // Two DMA-capable partial-render buffers (RGB565 = 2 bytes/pixel).
+        // The second buffer is what lets the driver DMA one region to the panel
+        // while LVGL renders the next region into the other — see flushRegion().
         size_t buf_bytes = (size_t)display.width() * LV_SETUP_BUFFER_ROWS * 2;
         lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_DMA);
-        if (!buf1) {
+        lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_DMA);
+        if (!buf1 || !buf2) {
             Serial.println("LVGL buffer allocation failed!");
             while (1) delay(100);
         }
-        lv_display_set_buffers(disp, buf1, NULL, buf_bytes,
+        lv_display_set_buffers(disp, buf1, buf2, buf_bytes,
                                LV_DISPLAY_RENDER_MODE_PARTIAL);
 
         static lv_indev_t *indev = lv_indev_create();
@@ -71,7 +74,10 @@ private:
     static uint32_t _tick_get(void) { return millis(); }
 
     static void _disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *pixelmap) {
-        // flushRegion byte-swaps the buffer in place and blits it over SPI.
+        // flushRegion byte-swaps in place, waits for the previous region's DMA,
+        // then QUEUES this region's DMA and returns before it finishes.  Calling
+        // flush_ready now lets LVGL render the next region into the other buffer
+        // while this one transmits; the driver serializes the bus internally.
         display.flushRegion(area->x1, area->y1, area->x2, area->y2,
                             (uint16_t *)pixelmap);
         lv_display_flush_ready(disp);
