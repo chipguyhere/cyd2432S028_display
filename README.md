@@ -1,9 +1,9 @@
 # chipguy_cyd2432S028_display
 
-A self-contained **display + touch** driver for the **CYD ESP32-2432S028**
+A self-contained **display + touch** driver for the **CYD ESP32-2432S028[R]**
 ("Cheap Yellow Display") — the common ESP32 dev board with a 2.8" 240×320 SPI
-LCD and a resistive touch panel. It drives the **ILI9341** display and the
-**XPT2046** touch controller so you don't have to think about either: the
+LCD and a resistive touch panel. It drives the display and the
+touch controller so you don't have to think about either: the
 hardware is fixed and fully handled, leaving you to write an **LVGL 9** app and
 nothing else.
 
@@ -13,34 +13,35 @@ and running before your code gets control. You pick the one that matches how you
 want to build your UI, copy it, and start replacing its placeholder UI with your
 own.
 
-> This is for the **ILI9341** flavor of the board. There are CYD variants with
-> different controllers (e.g. ST7789); those need a different driver.
+> This is for the **ILI9341 LCD with XPT2046 touch** flavor of the board. There are
+> CYD variants with different controllers (e.g. ST7789); those need a different library.
 
 ---
 
 ## Installation
 
-This library is distributed as a GitHub ZIP — there is no Arduino Library
-Manager entry. To install:
+This library is distributed by downloading the code as a ZIP from GitHub —
+there is no Arduino Library Manager entry. To install:
 
 1. On the GitHub project page, click **Code ▸ Download ZIP**.
-2. Unzip it. GitHub names the folder after the repository plus a branch suffix
-   (e.g. `cyd2432S028_display-main`); **rename it to
-   `chipguy_cyd2432S028_display`** so the folder name matches the library.
-3. Move that folder into your Arduino **libraries** directory:
+2. Unzip it, and move the resulting folder into your Arduino **libraries**
+   directory:
    - macOS / Linux: `~/Documents/Arduino/libraries/`
    - Windows: `Documents\Arduino\libraries\`
-4. Restart the Arduino IDE.
+3. Restart Arduino IDE so the examples will appear in the File menu.
 
 (Alternatively, in the IDE: **Sketch ▸ Include Library ▸ Add .ZIP Library…**
-and select the downloaded ZIP — but if it lands as `…-main`, rename it as above.)
+and select the downloaded ZIP.)
 
 ### Dependency: LVGL 9
 
-The examples need **LVGL 9** (developed against 9.3). Install it via the Arduino
+The examples need **LVGL 9**. Install it via the Arduino
 **Library Manager** (search "lvgl"). Each example sketch folder ships its own
 `lv_conf.h`; LVGL reads its configuration from that file, so keep it next to the
 `.ino`.
+
+This library was developed against LVGL 9.3 (the current version of LVGL that
+is compatible with Squareline) but is very likely compatible with later versions.
 
 ### Arduino IDE board settings
 
@@ -95,9 +96,8 @@ Use this when you'd rather **design the interface visually** in
 just run the result on the CYD.
 
 The sketch's `src/` folder holds a small **placeholder** UI in the exact file
-shape a SquareLine export produces (`ui.c`, `ui_Screen1.c`, `ui_events.c`,
-`ui_helpers.c`, …). The sketch calls the `ui_init()` that SquareLine generates.
-To start your app:
+shape a SquareLine export produces (`ui.c`, `ui_Screen1.c`, …). The sketch calls
+the `ui_init()` that SquareLine generates. To start your app:
 
 1. In SquareLine Studio, create a project sized to your orientation
    (**240×320** for portrait, 320×240 for landscape), **16-bit** color, with **no
@@ -105,12 +105,14 @@ To start your app:
    unrotated.
 2. Lay out your screens visually.
 3. **Export ▸ UI files** (the "Arduino TFT_eSPI profile" works, among others).
-4. **Delete the placeholder files** in the sketch's `src/` folder and drop your
-   exported files in their place. Build and upload — `ui_init()` now runs your
-   design.
+4. **Replace the whole `src/` folder** with your export. Build and upload —
+   `ui_init()` now runs your design.
 
-Your own event-handler code goes in `ui_events.c` (the one file SquareLine keeps
-across re-exports), so you can re-export the visuals freely without losing logic.
+Treat `src/` as disposable: you overwrite it wholesale each time you re-export
+from SquareLine, so don't keep anything there. Your own application logic lives
+in the **sketch** — after calling `ui_init()`, attach event handlers from the
+`.ino` to the UI objects SquareLine exposes (e.g. `ui_Button1`). That way
+re-exporting the visuals never touches your code.
 
 **Reach for this one** when you want to iterate on layout visually and write
 little or no C for the UI itself.
@@ -132,7 +134,7 @@ once `begin()` returns, you are just using plain LVGL.
 void setup() {
     Serial.begin(115200);
 
-    lv_setup.begin(0);          // initialize display + touch + LVGL (rotation 0)
+    lv_setup.begin();           // initialize display + touch + LVGL (default: portrait)
 
     // ...build your UI on lv_screen_active() here (or call ui_init())...
 }
@@ -145,10 +147,11 @@ void loop() {
 
 What the header provides:
 
-- **`lv_setup.begin(uint8_t rotation = 0)`** — call once in `setup()`. Brings up
+- **`lv_setup.begin(uint16_t rotation = 0)`** — call once in `setup()`. Brings up
   the ILI9341, the XPT2046 touch, and LVGL; creates the LVGL display and a
   pointer (touch) input device and connects them. After this returns, the active
-  LVGL screen exists and you build your UI with ordinary LVGL calls.
+  LVGL screen exists and you build your UI with ordinary LVGL calls. The
+  examples call it as `lv_setup.begin()` and take the default (portrait).
 - **`display`** — a global display object. Handy methods:
   `display.width()`, `display.height()` (for the current rotation), and
   `display.setBacklight(0..100)` to dim/brighten the backlight.
@@ -201,12 +204,6 @@ if (lv_setup.touch().readRaw(rx, ry))                 // press a corner, read Se
 lv_setup.touch().setCalibration(xMin, xMax, yMin, yMax);  // from your readings
 ```
 
-### Tuning note
-
-`lv_setup.hpp` defines `LV_SETUP_BUFFER_ROWS` (the height of LVGL's partial
-render buffer). Larger is smoother but uses more RAM; the default is a good
-balance for this board.
-
 ---
 
 ## License
@@ -215,6 +212,4 @@ MIT — see [LICENSE](LICENSE).
 
 The ILI9341 initialization/gamma values are standard panel-datasheet register
 settings (as also used by Adafruit_ILI9341, BSD-3). `lv_conf.h` is based on
-LVGL's template (LVGL is MIT-licensed). If you replace the placeholder
-SquareLine files with a real SquareLine Studio export, that generated code
-carries its own provenance.
+LVGL's template (LVGL is MIT-licensed).
