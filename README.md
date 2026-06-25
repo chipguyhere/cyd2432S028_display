@@ -117,6 +117,13 @@ re-exporting the visuals never touches your code.
 **Reach for this one** when you want to iterate on layout visually and write
 little or no C for the UI itself.
 
+### TouchCalibrate — a one-time setup tool, not a UI starting point
+
+The third bundled example, **`TouchCalibrate`**, isn't a template for your app —
+it's a tool you flash once to calibrate the touch panel and tune its noise
+filters, saving the result to flash so your real sketch loads it automatically.
+See [Touch calibration & filtering](#touch-calibration--filtering) below.
+
 ---
 
 ## What the examples give you: the `lv_setup` API
@@ -191,18 +198,28 @@ accepted as aliases for `1`/`2`/`3` (e.g. `lv_setup.begin(90)` is landscape).
 For the SquareLine example, size your SquareLine project to match the
 orientation you choose.
 
-### Touch calibration (only if needed)
+### Touch calibration & filtering
 
-The defaults work on typical CYDs. If touches land slightly off, read the raw
-ADC values at the screen corners and set your own calibration rectangle:
+You don't calibrate touch in code. The library ships a dedicated tool sketch,
+**`TouchCalibrate`** (File ▸ Examples ▸ chipguy_cyd2432S028_display), that you
+flash once, run, and then flash your real application over the top. It walks
+through three steps on the screen:
 
-```cpp
-uint16_t rx, ry;
-if (lv_setup.touch().readRaw(rx, ry))                 // press a corner, read Serial
-    Serial.printf("raw %u, %u\n", rx, ry);
+1. **Calibration** — tap a sequence of crosshairs with a stylus.
+2. **Filter settings** — two sliders set the touch noise filters: a **minimum
+   pressure** (ignore feather-light/phantom touches) and a **jump filter** (drop
+   glitchy readings that teleport across the screen), with a live readout to help
+   you pick values. A **Save** button stores them.
+3. **Drawing test** — scribble on the screen to confirm it tracks cleanly.
 
-lv_setup.touch().setCalibration(xMin, xMax, yMin, yMax);  // from your readings
-```
+Everything it produces — the calibration rectangle *and* the filter settings — is
+saved to the ESP32's **non-volatile storage preferences partition (NVS)**: the
+small flash area the Arduino `Preferences` library reads and writes, which
+survives reboots *and* reflashing your sketch.
+
+Your application then picks it up **automatically** — `lv_setup.begin()` calls
+`loadCalibration()` and `loadFilters()` at startup — so you never call
+`setCalibration()` yourself. Run `TouchCalibrate` once per board.
 
 ---
 

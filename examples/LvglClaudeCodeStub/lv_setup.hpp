@@ -32,6 +32,8 @@ public:
         Serial.println("Display initialized");
 
         _touch.begin();
+        _touch.loadCalibration();   // apply saved calibration if TouchCalibrate has run
+        _touch.loadFilters();       // and the saved pressure / jump-filter settings
         _touch.setRotation(rotation);
 
         lv_init();

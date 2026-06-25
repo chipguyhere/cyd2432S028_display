@@ -6,6 +6,17 @@
 #include "chipguy_cyd2432S028_touch.h"
 #include "chipguy_cyd2432S028_display.h"   // for CYD_TFT_NATIVE_WIDTH/HEIGHT
 
+#include <Preferences.h>
+
+// NVS namespace + keys for the persisted calibration rectangle.
+#define CYD_TOUCH_NVS_NS   "cydtouch"
+#define CYD_TOUCH_NVS_XMIN "xmin"
+#define CYD_TOUCH_NVS_XMAX "xmax"
+#define CYD_TOUCH_NVS_YMIN "ymin"
+#define CYD_TOUCH_NVS_YMAX "ymax"
+#define CYD_TOUCH_NVS_MINP "minp"   // minimum pressure filter
+#define CYD_TOUCH_NVS_JUMP "jump"   // max jump (px) filter
+
 // ── Board pin assignments (fixed on the ESP32-2432S028) ────────────────────
 #define CYD_TOUCH_CLK   25
 #define CYD_TOUCH_MOSI  32
@@ -16,6 +27,13 @@
 // XPT2046 control bytes: start bit + channel select, 12-bit, differential.
 #define XPT2046_CMD_X   0xD0   // read X position
 #define XPT2046_CMD_Y   0x90   // read Y position
+#define XPT2046_CMD_Z1  0xB0   // read Z1 (pressure)
+#define XPT2046_CMD_Z2  0xC0   // read Z2 (pressure)
+
+// Scale for the position-normalized pressure metric (see _readRawSample).  It
+// just sets the numeric range of pressure() / the minPressure slider; raise it
+// if firm presses read too low, lower it if they saturate at 4095.
+#define CYD_TOUCH_P_SCALE  100.0f
 
 // Default raw-ADC calibration rectangle (typical CYD; tune with readRaw()).
 #define CYD_TOUCH_X_MIN  200
@@ -23,8 +41,10 @@
 #define CYD_TOUCH_Y_MIN  200
 #define CYD_TOUCH_Y_MAX  3900
 
-// Number of samples averaged per read to smooth resistive jitter.
-static const int CYD_TOUCH_SAMPLES = 4;
+// Samples taken per axis per read.  We return the MEDIAN of these (not the
+// mean), which discards the occasional spike instead of blending it in.  Odd
+// so the median is a single middle element.
+static const int CYD_TOUCH_SAMPLES = 7;
 
 chipguy_cyd2432S028_touch::chipguy_cyd2432S028_touch()
     : _xMin(CYD_TOUCH_X_MIN), _xMax(CYD_TOUCH_X_MAX),
@@ -53,6 +73,68 @@ void chipguy_cyd2432S028_touch::setCalibration(uint16_t xMin, uint16_t xMax,
     _yMin = yMin; _yMax = yMax;
 }
 
+void chipguy_cyd2432S028_touch::getCalibration(uint16_t &xMin, uint16_t &xMax,
+                                               uint16_t &yMin, uint16_t &yMax) const {
+    xMin = _xMin; xMax = _xMax;
+    yMin = _yMin; yMax = _yMax;
+}
+
+bool chipguy_cyd2432S028_touch::loadCalibration() {
+    Preferences prefs;
+    if (!prefs.begin(CYD_TOUCH_NVS_NS, /*readOnly=*/true)) return false;
+    // Treat the calibration as present only if all four keys exist.
+    bool ok = prefs.isKey(CYD_TOUCH_NVS_XMIN) && prefs.isKey(CYD_TOUCH_NVS_XMAX) &&
+              prefs.isKey(CYD_TOUCH_NVS_YMIN) && prefs.isKey(CYD_TOUCH_NVS_YMAX);
+    if (ok) {
+        _xMin = prefs.getUShort(CYD_TOUCH_NVS_XMIN, _xMin);
+        _xMax = prefs.getUShort(CYD_TOUCH_NVS_XMAX, _xMax);
+        _yMin = prefs.getUShort(CYD_TOUCH_NVS_YMIN, _yMin);
+        _yMax = prefs.getUShort(CYD_TOUCH_NVS_YMAX, _yMax);
+    }
+    prefs.end();
+    return ok;
+}
+
+void chipguy_cyd2432S028_touch::saveCalibration() {
+    Preferences prefs;
+    if (!prefs.begin(CYD_TOUCH_NVS_NS, /*readOnly=*/false)) return;
+    prefs.putUShort(CYD_TOUCH_NVS_XMIN, _xMin);
+    prefs.putUShort(CYD_TOUCH_NVS_XMAX, _xMax);
+    prefs.putUShort(CYD_TOUCH_NVS_YMIN, _yMin);
+    prefs.putUShort(CYD_TOUCH_NVS_YMAX, _yMax);
+    prefs.end();
+}
+
+void chipguy_cyd2432S028_touch::setFilters(uint16_t minPressure, uint16_t maxJump) {
+    _minPressure = minPressure;
+    _maxJump = maxJump;
+}
+
+void chipguy_cyd2432S028_touch::getFilters(uint16_t &minPressure, uint16_t &maxJump) const {
+    minPressure = _minPressure;
+    maxJump = _maxJump;
+}
+
+bool chipguy_cyd2432S028_touch::loadFilters() {
+    Preferences prefs;
+    if (!prefs.begin(CYD_TOUCH_NVS_NS, /*readOnly=*/true)) return false;
+    bool ok = prefs.isKey(CYD_TOUCH_NVS_MINP) && prefs.isKey(CYD_TOUCH_NVS_JUMP);
+    if (ok) {
+        _minPressure = prefs.getUShort(CYD_TOUCH_NVS_MINP, _minPressure);
+        _maxJump     = prefs.getUShort(CYD_TOUCH_NVS_JUMP, _maxJump);
+    }
+    prefs.end();
+    return ok;
+}
+
+void chipguy_cyd2432S028_touch::saveFilters() {
+    Preferences prefs;
+    if (!prefs.begin(CYD_TOUCH_NVS_NS, /*readOnly=*/false)) return;
+    prefs.putUShort(CYD_TOUCH_NVS_MINP, _minPressure);
+    prefs.putUShort(CYD_TOUCH_NVS_JUMP, _maxJump);
+    prefs.end();
+}
+
 // Bit-bang one XPT2046 conversion: send the 8-bit command, then clock out the
 // 12-bit result (MSB first).  SPI mode 0, sampled on the rising edge.
 uint16_t chipguy_cyd2432S028_touch::_transferByteAndRead12(uint8_t cmd) {
@@ -77,23 +159,62 @@ uint16_t chipguy_cyd2432S028_touch::_transferByteAndRead12(uint8_t cmd) {
     return value;
 }
 
+// Read one channel CYD_TOUCH_SAMPLES times and return the MEDIAN.  The first
+// conversion right after switching channels is the least settled, so we take a
+// throwaway read before sampling.  The median rejects outliers (the spikes that
+// make a plain average jump around) far better than a mean.  Call with CS
+// already asserted (LOW) — _readRawSample holds it for the whole sample block.
+uint16_t chipguy_cyd2432S028_touch::_readChannelMedian(uint8_t cmd) {
+    uint16_t buf[CYD_TOUCH_SAMPLES];
+    _transferByteAndRead12(cmd);                              // throwaway: let it settle
+    for (int i = 0; i < CYD_TOUCH_SAMPLES; i++) buf[i] = _transferByteAndRead12(cmd);
+
+    // Insertion sort (tiny fixed array), then take the middle element.
+    for (int i = 1; i < CYD_TOUCH_SAMPLES; i++) {
+        uint16_t v = buf[i];
+        int j = i - 1;
+        while (j >= 0 && buf[j] > v) { buf[j + 1] = buf[j]; j--; }
+        buf[j + 1] = v;
+    }
+    return buf[CYD_TOUCH_SAMPLES / 2];
+}
+
 bool chipguy_cyd2432S028_touch::_readRawSample(uint16_t &rawX, uint16_t &rawY) {
     // IRQ is pulled low by the controller only while the panel is pressed.
     if (digitalRead(CYD_TOUCH_IRQ) != LOW) return false;
 
-    uint32_t sumX = 0, sumY = 0;
     digitalWrite(CYD_TOUCH_CS, LOW);
-    for (int i = 0; i < CYD_TOUCH_SAMPLES; i++) {
-        sumX += _transferByteAndRead12(XPT2046_CMD_X);
-        sumY += _transferByteAndRead12(XPT2046_CMD_Y);
-    }
+    // Median of several conversions per axis rejects the occasional spike far
+    // better than a mean (which blends it in) — resistive jitter is mostly
+    // impulse noise.  See _readChannelMedian.
+    rawX = _readChannelMedian(XPT2046_CMD_X);
+    rawY = _readChannelMedian(XPT2046_CMD_Y);
+
+    // Pressure via the XPT2046 datasheet touch-resistance formula:
+    //   R_touch ∝ (xpos / 4096) * (z2/z1 - 1)
+    // The (xpos/4096) term divides out the touch position, so the result is
+    // roughly uniform across the panel — unlike the raw z1+4096-z2 proxy, which
+    // reads much lighter near the low-rawX edge.  We report its inverse
+    // (conductance), scaled, so higher = firmer press (matching minPressure).
+    uint16_t z1 = _transferByteAndRead12(XPT2046_CMD_Z1);
+    uint16_t z2 = _transferByteAndRead12(XPT2046_CMD_Z2);
     digitalWrite(CYD_TOUCH_CS, HIGH);
+
+    uint16_t xpos = rawX;                  // median X position for the formula
+    float p = 0.0f;
+    if (z1 > 0 && xpos > 0) {
+        if (z2 <= z1) {
+            p = 4095.0f;                       // resistance ~0 (or noise): treat as firmest
+        } else {
+            float r = ((float)xpos / 4096.0f) * ((float)z2 / (float)z1 - 1.0f);
+            p = (r > 0.0f) ? CYD_TOUCH_P_SCALE / r : 4095.0f;
+        }
+    }
+    _lastPressure = (uint16_t)(p > 4095.0f ? 4095.0f : p);
 
     // Still pressed after sampling?  Rejects spurious single-edge IRQs.
     if (digitalRead(CYD_TOUCH_IRQ) != LOW) return false;
 
-    rawX = sumX / CYD_TOUCH_SAMPLES;
-    rawY = sumY / CYD_TOUCH_SAMPLES;
     return true;
 }
 
@@ -103,7 +224,14 @@ bool chipguy_cyd2432S028_touch::readRaw(uint16_t &rawX, uint16_t &rawY) {
 
 bool chipguy_cyd2432S028_touch::read(uint16_t &x, uint16_t &y) {
     uint16_t rawX, rawY;
-    if (!_readRawSample(rawX, rawY)) return false;
+    if (!_readRawSample(rawX, rawY)) {
+        _hasLast = false;       // released: forget the last point for jump filter
+        _jumpCount = 0;
+        return false;
+    }
+
+    // Pressure filter: reject touches lighter than the configured threshold.
+    if (_minPressure > 0 && _lastPressure < _minPressure) return false;
 
     // Clamp to the calibration rectangle, then map to physical pixels
     // (240 wide x 320 tall, before rotation).
@@ -126,5 +254,15 @@ bool chipguy_cyd2432S028_touch::read(uint16_t &x, uint16_t &y) {
         case 2:  x = W - px;      y = H - py;      break;  // portrait flipped
         case 3:  x = H - py;      y = px;          break;  // landscape flipped
     }
+
+    // Jump filter: drop a reading that teleports more than _maxJump pixels from
+    // the last accepted point.  A real fast drag survives because we let the
+    // reading through after a couple of consecutive "jumps".
+    if (_maxJump > 0 && _hasLast) {
+        long d = labs((long)x - _lastX) + labs((long)y - _lastY);
+        if (d > _maxJump && ++_jumpCount < 3) return false;
+    }
+    _jumpCount = 0;
+    _lastX = x; _lastY = y; _hasLast = true;
     return true;
 }
